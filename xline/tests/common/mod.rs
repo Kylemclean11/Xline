@@ -73,12 +73,7 @@ impl Cluster {
     /// Create or get the client with the specified index
     pub(crate) async fn client(&mut self) -> &mut Client {
         if self.client.is_none() {
-            let client = Client::new(self.all_members.clone(), true)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("Client connect error: {:?}", e);
-                });
-            self.client = Some(client);
+            self.client = Some(Client::new(self.all_members.clone(), true).await);
         }
         self.client.as_mut().unwrap()
     }

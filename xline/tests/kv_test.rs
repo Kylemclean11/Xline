@@ -2,30 +2,36 @@ mod common;
 
 use std::error::Error;
 
-use xline::client::kv_types::{
-    DeleteRangeRequest, PutRequest, RangeRequest, SortOrder, SortTarget,
-};
+use xline::client::{DeleteRangeOptions, PutOptions, RangeOptions, SortOrder, SortTarget};
 
 use crate::common::Cluster;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_kv_put() -> Result<(), Box<dyn Error>> {
-    struct TestCase {
-        req: PutRequest,
+    struct TestCase<'a> {
+        key: &'a str,
+        value: &'a str,
+        opts: Option<PutOptions>,
         want_err: bool,
     }
 
     let tests = [
         TestCase {
-            req: PutRequest::new("foo", "").with_ignore_value(true),
+            key: "foo",
+            value: "",
+            opts: Some(PutOptions::new().with_ignore_value(true)),
             want_err: true,
         },
         TestCase {
-            req: PutRequest::new("foo", "bar"),
+            key: "foo",
+            value: "bar",
+            opts: None,
             want_err: false,
         },
         TestCase {
-            req: PutRequest::new("foo", "").with_ignore_value(true),
+            key: "foo",
+            value: "",
+            opts: Some(PutOptions::new().with_ignore_value(true)),
             want_err: false,
         },
     ];
@@ -35,7 +41,7 @@ async fn test_kv_put() -> Result<(), Box<dyn Error>> {
     let client = cluster.client().await;
 
     for test in tests {
-        let res = client.put(test.req).await;
+        let res = client.put(test.key, test.value, test.opts).await;
         assert_eq!(res.is_err(), test.want_err);
     }
 
@@ -45,7 +51,8 @@ async fn test_kv_put() -> Result<(), Box<dyn Error>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_kv_get() -> Result<(), Box<dyn Error>> {
     struct TestCase<'a> {
-        req: RangeRequest,
+        key: &'a str,
+        opts: Option<RangeOptions>,
         want_kvs: &'a [&'a str],
     }
 
@@ -60,92 +67,118 @@ async fn test_kv_get() -> Result<(), Box<dyn Error>> {
 
     let tests = [
         TestCase {
-            req: RangeRequest::new("a"),
+            key: "a",
+            opts: None,
             want_kvs: &want_kvs[..1],
         },
         // TestCase {
-        //     req: RangeRequest::new("a").with_serializable(true),
+        //     key: "a",
+        //     opts: Some(RangeOptions::new().with_serializable(true)),
         //     want_kvs: &want_kvs[..1],
         // },
         TestCase {
-            req: RangeRequest::new("a").with_range_end("c"),
+            key: "a",
+            opts: Some(RangeOptions::new().with_range_end("c")),
             want_kvs: &want_kvs[..2],
         },
         TestCase {
-            req: RangeRequest::new("").with_prefix(),
+            key: "",
+            opts: Some(RangeOptions::new().with_prefix()),
             want_kvs: &want_kvs[..],
         },
         TestCase {
-            req: RangeRequest::new("").with_from_key(),
+            key: "",
+            opts: Some(RangeOptions::new().with_from_key()),
             want_kvs: &want_kvs[..],
         },
         TestCase {
-            req: RangeRequest::new("a").with_range_end("x"),
+            key: "a",
+            opts: Some(RangeOptions::new().with_range_end("x")),
             want_kvs: &want_kvs[..],
         },
         TestCase {
-            req: RangeRequest::new("").with_prefix().with_revision(4),
+            key: "",
+            opts: Some(RangeOptions::new().with_prefix().with_revision(4)),
             want_kvs: &want_kvs[..3],
         },
         TestCase {
-            req: RangeRequest::new("a").with_count_only(true),
+            key: "a",
+            opts: Some(RangeOptions::new().with_count_only(true)),
             want_kvs: &[],
         },
         TestCase {
-            req: RangeRequest::new("foo").with_prefix(),
+            key: "foo",
+            opts: Some(RangeOptions::new().with_prefix()),
             want_kvs: &["foo", "foo/abc"],
         },
         TestCase {
-            req: RangeRequest::new("foo").with_from_key(),
+            key: "foo",
+            opts: Some(RangeOptions::new().with_from_key()),
             want_kvs: &["foo", "foo/abc", "fop"],
         },
         TestCase {
-            req: RangeRequest::new("").with_prefix().with_limit(2),
+            key: "",
+            opts: Some(RangeOptions::new().with_prefix().with_limit(2)),
             want_kvs: &want_kvs[..2],
         },
         TestCase {
-            req: RangeRequest::new("")
-                .with_prefix()
-                .with_sort_target(SortTarget::Mod)
-                .with_sort_order(SortOrder::Ascend),
+            key: "",
+            opts: Some(
+                RangeOptions::new()
+                    .with_prefix()
+                    .with_sort_target(SortTarget::Mod)
+                    .with_sort_order(SortOrder::Ascend),
+            ),
             want_kvs: &want_kvs[..],
         },
         TestCase {
-            req: RangeRequest::new("")
-                .with_prefix()
-                .with_sort_target(SortTarget::Version)
-                .with_sort_order(SortOrder::Ascend),
+            key: "",
+            opts: Some(
+                RangeOptions::new()
+                    .with_prefix()
+                    .with_sort_target(SortTarget::Version)
+                    .with_sort_order(SortOrder::Ascend),
+            ),
             want_kvs: &kvs_by_version[..],
         },
         TestCase {
-            req: RangeRequest::new("")
-                .with_prefix()
-                .with_sort_target(SortTarget::Create)
-                .with_sort_order(SortOrder::None),
+            key: "",
+            opts: Some(
+                RangeOptions::new()
+                    .with_prefix()
+                    .with_sort_target(SortTarget::Create)
+                    .with_sort_order(SortOrder::None),
+            ),
             want_kvs: &want_kvs[..],
         },
         TestCase {
-            req: RangeRequest::new("")
-                .with_prefix()
-                .with_sort_target(SortTarget::Create)
-                .with_sort_order(SortOrder::Descend),
+            key: "",
+            opts: Some(
+                RangeOptions::new()
+                    .with_prefix()
+                    .with_sort_target(SortTarget::Create)
+                    .with_sort_order(SortOrder::Descend),
+            ),
             want_kvs: &reversed_kvs[..],
         },
         TestCase {
-            req: RangeRequest::new("")
-                .with_prefix()
-                .with_sort_target(SortTarget::Key)
-                .with_sort_order(SortOrder::Descend),
+            key: "",
+            opts: Some(
+                RangeOptions::new()
+                    .with_prefix()
+                    .with_sort_target(SortTarget::Key)
+                    .with_sort_order(SortOrder::Descend),
+            ),
             want_kvs: &reversed_kvs[..],
         },
     ];
 
     for key in kvs {
-        client.put(PutRequest::new(key, "bar")).await?;
+        client.put(key, "bar", None).await?;
     }
 
     for test in tests {
-        let res = client.range(test.req).await?;
+        let res = client.get(test.key, test.opts).await?;
         assert_eq!(res.kvs.len(), test.want_kvs.len());
         let is_identical = res
             .kvs
@@ -161,7 +194,8 @@ async fn test_kv_get() -> Result<(), Box<dyn Error>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_kv_delete() -> Result<(), Box<dyn Error>> {
     struct TestCase<'a> {
-        req: DeleteRangeRequest,
+        key: &'a str,
+        opts: Option<DeleteRangeOptions>,
         want_deleted: i64,
         want_keys: &'a [&'a str],
     }
@@ -174,37 +208,44 @@ async fn test_kv_delete() -> Result<(), Box<dyn Error>> {
 
     let tests = [
         TestCase {
-            req: DeleteRangeRequest::new("").with_prefix(),
+            key: "",
+            opts: Some(DeleteRangeOptions::new().with_prefix()),
             want_deleted: 5,
             want_keys: &[],
         },
         TestCase {
-            req: DeleteRangeRequest::new("").with_from_key(),
+            key: "",
+            opts: Some(DeleteRangeOptions::new().with_from_key()),
             want_deleted: 5,
             want_keys: &[],
         },
         TestCase {
-            req: DeleteRangeRequest::new("a").with_range_end("c"),
+            key: "a",
+            opts: Some(DeleteRangeOptions::new().with_range_end("c")),
             want_deleted: 2,
             want_keys: &["c", "c/abc", "d"],
         },
         TestCase {
-            req: DeleteRangeRequest::new("c"),
+            key: "c",
+            opts: None,
             want_deleted: 1,
             want_keys: &["a", "b", "c/abc", "d"],
         },
         TestCase {
-            req: DeleteRangeRequest::new("c").with_prefix(),
+            key: "c",
+            opts: Some(DeleteRangeOptions::new().with_prefix()),
             want_deleted: 2,
             want_keys: &["a", "b", "d"],
         },
         TestCase {
-            req: DeleteRangeRequest::new("c").with_from_key(),
+            key: "c",
+            opts: Some(DeleteRangeOptions::new().with_from_key()),
             want_deleted: 3,
             want_keys: &["a", "b"],
         },
         TestCase {
-            req: DeleteRangeRequest::new("e"),
+            key: "e",
+            opts: None,
             want_deleted: 0,
             want_keys: &keys,
         },
@@ -212,13 +253,15 @@ async fn test_kv_delete() -> Result<(), Box<dyn Error>> {
 
     for test in tests {
         for key in keys {
-            client.put(PutRequest::new(key, "bar")).await?;
+            client.put(key, "bar", None).await?;
         }
 
-        let res = client.delete(test.req).await?;
+        let res = client.delete(test.key, test.opts).await?;
         assert_eq!(res.deleted, test.want_deleted);
 
-        let res = client.range(RangeRequest::new("").with_prefix()).await?;
+        let res = client
+            .get("", Some(RangeOptions::new().with_all_keys()))
+            .await?;
         let is_identical = res
             .kvs
             .iter()

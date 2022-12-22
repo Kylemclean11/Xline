@@ -75,6 +75,7 @@ pub(crate) use self::authpb::{permission::Type, Permission, Role, User};
 pub(crate) use self::etcdserverpb::{
     auth_server::{Auth, AuthServer},
     compare::{CompareResult, CompareTarget, TargetUnion},
+    kv_client::KvClient,
     kv_server::{Kv, KvServer},
     lease_server::{Lease, LeaseServer},
     request_op::Request,
@@ -91,12 +92,11 @@ pub(crate) use self::etcdserverpb::{
     AuthUserGetRequest, AuthUserGetResponse, AuthUserGrantRoleRequest, AuthUserGrantRoleResponse,
     AuthUserListRequest, AuthUserListResponse, AuthUserRevokeRoleRequest,
     AuthUserRevokeRoleResponse, AuthenticateRequest, AuthenticateResponse, CompactionRequest,
-    CompactionResponse, Compare, DeleteRangeRequest, DeleteRangeResponse, LeaseGrantRequest,
-    LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse, LeaseLeasesRequest,
-    LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse, LeaseTimeToLiveRequest,
-    LeaseTimeToLiveResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp,
-    ResponseHeader, ResponseOp, TxnRequest, TxnResponse, WatchCancelRequest, WatchCreateRequest,
-    WatchRequest, WatchResponse,
+    Compare, DeleteRangeRequest, LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest,
+    LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest,
+    LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, PutRequest, RangeRequest,
+    RequestOp, ResponseOp, TxnRequest, WatchCancelRequest, WatchCreateRequest, WatchRequest,
+    WatchResponse,
 };
 pub(crate) use self::mvccpb::{event::EventType, Event, KeyValue};
 pub(crate) use self::v3lockpb::{
@@ -104,7 +104,11 @@ pub(crate) use self::v3lockpb::{
     LockRequest, LockResponse, UnlockRequest, UnlockResponse,
 };
 
-pub use self::etcdserverpb::range_request::{SortOrder, SortTarget};
+pub use self::etcdserverpb::{
+    range_request::{SortOrder, SortTarget},
+    CompactionResponse, DeleteRangeResponse, PutResponse, RangeResponse, ResponseHeader,
+    TxnResponse,
+};
 
 impl User {
     /// Check if user has the given role
@@ -323,12 +327,14 @@ macro_rules! impl_from_requests {
     ($($req:ident),*) => {
         $(
             impl From<$req> for RequestWrapper {
+                #[inline]
                 fn from(req: $req) -> Self {
                     RequestWrapper::$req(req)
                 }
             }
 
             impl From<RequestWrapper> for $req {
+                #[inline]
                 fn from(req: RequestWrapper) -> Self {
                     match req {
                         RequestWrapper::$req(req) => req,
@@ -345,12 +351,14 @@ macro_rules! impl_from_responses {
     ($($resp:ident),*) => {
         $(
             impl From<$resp> for ResponseWrapper {
+                #[inline]
                 fn from(resp: $resp) -> Self {
                     ResponseWrapper::$resp(resp)
                 }
             }
 
             impl From<ResponseWrapper> for $resp {
+                #[inline]
                 fn from(resp: ResponseWrapper) -> Self {
                     match resp {
                         ResponseWrapper::$resp(resp) => resp,
