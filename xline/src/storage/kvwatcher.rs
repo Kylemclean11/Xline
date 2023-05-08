@@ -10,10 +10,14 @@ use std::{
 use clippy_utilities::OverflowArithmetic;
 use log::warn;
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 use super::storage_api::StorageApi;
-use crate::{rpc::Event, server::command::KeyRange, storage::kv_store::KvStore};
+use crate::{
+    rpc::{Event, ResponseHeader, WatchResponse},
+    server::command::KeyRange,
+    storage::kv_store::KvStore,
+};
 
 /// Watch ID
 pub(crate) type WatchId = i64;
@@ -45,8 +49,10 @@ struct Watcher {
     start_rev: i64,
     /// Event filters
     filters: Vec<i32>,
+    /// Stop notify
+    stop_notify: Arc<event_listener::Event>,
     /// Sender of watch event
-    event_tx: mpsc::Sender<WatchEvent>,
+    res_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
 }
 
 impl PartialEq for Watcher {
@@ -70,14 +76,16 @@ impl Watcher {
         watch_id: WatchId,
         start_rev: i64,
         filters: Vec<i32>,
-        event_tx: mpsc::Sender<WatchEvent>,
+        stop_notify: Arc<event_listener::Event>,
+        res_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     ) -> Self {
         Self {
             key_range,
             watch_id,
             start_rev,
             filters,
-            event_tx,
+            stop_notify,
+            res_tx,
         }
     }
 
@@ -102,15 +110,31 @@ impl Watcher {
             return;
         }
         events.retain(|event| self.filters.iter().all(|filter| filter != &event.r#type));
-        let watch_event = WatchEvent {
-            id: self.watch_id(),
+
+        let watch_id = self.watch_id();
+        if events.is_empty() {
+            return;
+        }
+        let response = WatchResponse {
+            header: Some(ResponseHeader {
+                revision,
+                ..ResponseHeader::default()
+            }),
+            watch_id,
             events,
-            revision,
+            ..WatchResponse::default()
         };
-        #[allow(clippy::todo)]
-        match self.event_tx.try_send(watch_event) {
-            Ok(_) => {}
-            Err(_) => todo!(), // TODO: send error will move this watcher to victims
+        #[allow(clippy::todo)] // TODO: send error will move this watcher to victims
+        if let Err(e) = self.res_tx.try_send(Ok(response)) {
+            match e {
+                TrySendError::Full(_) => {
+                    todo!()
+                }
+                TrySendError::Closed(_) => {
+                    warn!("watcher {} is closed", self.watch_id);
+                    self.stop_notify.notify(1);
+                }
+            }
         }
     }
 }
@@ -195,7 +219,8 @@ pub(crate) trait KvWatcherOps {
         key_range: KeyRange,
         start_rev: i64,
         filters: Vec<i32>,
-        event_tx: mpsc::Sender<WatchEvent>,
+        stop_notify: Arc<event_listener::Event>,
+        res_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     );
 
     /// Cancel a watch from KV store
@@ -214,9 +239,17 @@ where
         key_range: KeyRange,
         start_rev: i64,
         filters: Vec<i32>,
-        event_tx: mpsc::Sender<WatchEvent>,
+        stop_notify: Arc<event_listener::Event>,
+        res_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     ) {
-        let mut watcher = Watcher::new(key_range.clone(), id, start_rev, filters, event_tx);
+        let mut watcher = Watcher::new(
+            key_range.clone(),
+            id,
+            start_rev,
+            filters,
+            stop_notify,
+            res_tx,
+        );
         let mut watcher_map_w = self.watcher_map.write();
 
         let initial_events = if start_rev == 0 {
@@ -317,34 +350,6 @@ where
     }
 }
 
-/// Watch Event
-#[derive(Debug)]
-pub(crate) struct WatchEvent {
-    /// Watch ID
-    id: WatchId,
-    /// Events to be sent
-    events: Vec<Event>,
-    /// Revision when this event is generated
-    revision: i64,
-}
-
-impl WatchEvent {
-    /// Get revision
-    pub(crate) fn revision(&self) -> i64 {
-        self.revision
-    }
-
-    /// Get `WatchId`
-    pub(crate) fn watch_id(&self) -> WatchId {
-        self.id
-    }
-
-    /// Take events
-    pub(crate) fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
-    }
-}
-
 #[cfg(test)]
 mod test {
 
@@ -384,14 +389,22 @@ mod test {
             }
         });
         tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-        let (event_tx, mut event_rx) = mpsc::channel(128);
-        kv_watcher.watch(123, KeyRange::new_one_key("foo"), 1, vec![], event_tx);
+        let (res_tx, mut res_rx) = mpsc::channel(128);
+        let stop_notify = Arc::new(event_listener::Event::new());
+        kv_watcher.watch(
+            123,
+            KeyRange::new_one_key("foo"),
+            1,
+            vec![],
+            stop_notify,
+            res_tx,
+        );
 
-        'outer: while let Some(event_batch) = timeout(Duration::from_secs(3), event_rx.recv())
+        'outer: while let Some(event_batch) = timeout(Duration::from_secs(3), res_rx.recv())
             .await
             .unwrap()
         {
-            for event in event_batch.events {
+            for event in event_batch.unwrap().events {
                 let val = event.kv.as_ref().unwrap().value[0];
                 let e = map.entry(val).or_insert(0);
                 *e += 1;
