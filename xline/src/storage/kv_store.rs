@@ -141,11 +141,6 @@ where
         }
     }
 
-    /// Get revision of KV store
-    pub(crate) fn revision(&self) -> i64 {
-        self.revision.get()
-    }
-
     /// Notify KV changes to KV watcher
     async fn notify_updates(&self, revision: i64, updates: Vec<Event>) {
         assert!(

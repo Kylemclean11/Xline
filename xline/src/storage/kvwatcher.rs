@@ -5,13 +5,19 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use clippy_utilities::OverflowArithmetic;
 use itertools::Itertools;
 use log::warn;
 use parking_lot::RwLock;
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::{
+    sync::mpsc::{self, error::TrySendError},
+    time::sleep,
+};
+use tracing::debug;
+use utils::parking_lot_lock::RwLockMap;
 
 use super::storage_api::StorageApi;
 use crate::{
@@ -106,16 +112,30 @@ impl Watcher {
     }
 
     /// Notify events
-    fn notify(&self, (revision, mut events): (i64, Vec<Event>)) {
+    fn notify(
+        &mut self,
+        (revision, mut events): (i64, Vec<Event>),
+    ) -> Result<(), TrySendError<(i64, Vec<Event>)>> {
         if revision < self.start_rev() {
-            return;
+            return Ok(());
         }
-        events.retain(|event| self.filters.iter().all(|filter| filter != &event.r#type));
-
+        events.retain(|event| {
+            self.filters.iter().all(|filter| filter != &event.r#type)
+                && (event
+                    .kv
+                    .as_ref()
+                    .map_or(false, |kv| kv.mod_revision >= self.start_rev))
+        });
         let watch_id = self.watch_id();
         if events.is_empty() {
-            return;
+            return Ok(());
         }
+        debug!(
+            watch_id,
+            revision,
+            events_len = events.len(),
+            "try to send watch response"
+        );
         let response = WatchResponse {
             header: Some(ResponseHeader {
                 revision,
@@ -125,16 +145,24 @@ impl Watcher {
             events,
             ..WatchResponse::default()
         };
-        #[allow(clippy::todo)] // TODO: send error will move this watcher to victims
-        if let Err(e) = self.res_tx.try_send(Ok(response)) {
-            match e {
-                TrySendError::Full(_) => {
-                    todo!()
-                }
-                TrySendError::Closed(_) => {
-                    warn!("watcher {} is closed", self.watch_id);
-                    self.stop_notify.notify(1);
-                }
+        match self.res_tx.try_send(Ok(response)) {
+            Ok(_) => {
+                debug!(watch_id, revision, "response sent successfully");
+                self.start_rev = revision.overflow_add(1);
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => {
+                debug!(watch_id, revision, "watcher is closed");
+                self.stop_notify.notify(1);
+                Ok(())
+            }
+            Err(TrySendError::Full(res)) => {
+                debug!(
+                    watch_id,
+                    revision, "response channel is full, will try to send later"
+                );
+                let resp = res.unwrap_or_else(|_e| panic!("Sender send `Ok`"));
+                Err(TrySendError::Full((revision, resp.events)))
             }
         }
     }
@@ -149,29 +177,32 @@ where
     /// KV storage
     storage: Arc<KvStore<S>>,
     /// Watch indexes
-    watcher_map: RwLock<WatcherMap>,
+    watcher_map: Arc<RwLock<WatcherMap>>,
 }
 
 /// Store all watchers
 #[derive(Debug)]
 struct WatcherMap {
-    /// All watchers
-    watchers: HashMap<WatchId, Watcher>,
     /// Index for watchers
     index: HashMap<KeyRange, HashSet<WatchId>>,
+    /// All watchers
+    watchers: HashMap<WatchId, Watcher>,
+    /// Victims
+    victims: HashMap<Watcher, (i64, Vec<Event>)>,
 }
 
 impl WatcherMap {
     /// Create a new `WatcherMap`
     fn new() -> Self {
         Self {
-            watchers: HashMap::new(),
             index: HashMap::new(),
+            watchers: HashMap::new(),
+            victims: HashMap::new(),
         }
     }
 
     /// Insert a new watcher to the map and create. Internally, it will create a index for this watcher.
-    fn insert(&mut self, watcher: Watcher) {
+    fn register(&mut self, watcher: Watcher) {
         let key_range = watcher.key_range().clone();
         let watch_id = watcher.watch_id();
         assert!(
@@ -187,25 +218,54 @@ impl WatcherMap {
         );
     }
 
-    /// Remove a watcher
-    #[allow(clippy::expect_used)] // the logic is managed internally
-    fn remove(&mut self, watch_id: WatchId) {
-        let watcher = self.watchers.remove(&watch_id).expect("no such watcher");
-        let key_range = watcher.key_range();
-        let is_empty = {
-            let watchers = self
-                .index
-                .get_mut(key_range)
-                .expect("no such watcher in index");
-            assert!(
-                watchers.remove(&watcher.watch_id()),
-                "no such watcher in index"
-            );
-            watchers.is_empty()
+    /// Move a watcher to victims, the `watch_id` must be valid.
+    fn move_to_victim(&mut self, watch_id: WatchId, updates: (i64, Vec<Event>)) {
+        let Some(watcher) = self.watchers.remove(&watch_id) else {
+            panic!("watcher should exist")
         };
-        if is_empty {
-            assert!(self.index.remove(key_range).is_some());
+        let Some(watch_ids) = self.index.get_mut(watcher.key_range()) else {
+            panic!("watch_ids should exist")
+        };
+        assert!(
+            watch_ids.remove(&watcher.watch_id()),
+            "no such watcher in index"
+        );
+        if watch_ids.is_empty() {
+            assert!(
+                self.index.remove(&watcher.key_range).is_some(),
+                "watch_ids should exist"
+            );
         }
+        assert!(
+            self.victims.insert(watcher, updates).is_none(),
+            "can't insert watcher twice"
+        );
+    }
+
+    /// Remove a watcher
+    fn remove(&mut self, watch_id: WatchId) {
+        if let Some(watcher) = self.watchers.remove(&watch_id) {
+            let key_range = watcher.key_range();
+            let is_empty = {
+                let Some(watch_ids) = self.index.get_mut(watcher.key_range()) else {
+                    panic!("watch_ids should exist")
+                };
+                assert!(
+                    watch_ids.remove(&watcher.watch_id()),
+                    "no such watcher in index"
+                );
+                watch_ids.is_empty()
+            };
+            if is_empty {
+                assert!(self.index.remove(key_range).is_some());
+            }
+        } else {
+            self.victims = self
+                .victims
+                .drain()
+                .filter(|pair| pair.0.watch_id() != watch_id)
+                .collect();
+        };
     }
 }
 
@@ -264,21 +324,20 @@ where
                     vec![]
                 })
         };
-        if initial_events.is_empty() {
-            watcher.start_rev = self.storage.revision().overflow_add(1);
-        } else {
-            let last_revision = initial_events
-                .last()
-                .unwrap_or_else(|| unreachable!("initial_events is not empty"))
-                .kv
-                .as_ref()
-                .unwrap_or_else(|| panic!("event.kv can't be None"))
-                .mod_revision;
-
-            watcher.notify((last_revision, initial_events));
-            watcher.start_rev = last_revision.overflow_add(1);
+        if !initial_events.is_empty() {
+            let last_revision = get_last_revision(&initial_events);
+            if let Err(TrySendError::Full(updates)) =
+                watcher.notify((last_revision, initial_events))
+            {
+                assert!(
+                    watcher_map_w.victims.insert(watcher, updates).is_none(),
+                    "can't insert watcher twice"
+                );
+                return;
+            };
         }
-        watcher_map_w.insert(watcher);
+        debug!("register watcher: {:?}", watcher);
+        watcher_map_w.register(watcher);
     }
 
     /// Cancel a watch from KV store
@@ -296,25 +355,78 @@ where
         storage: Arc<KvStore<S>>,
         mut kv_update_rx: mpsc::Receiver<(i64, Vec<Event>)>,
     ) -> Arc<Self> {
+        let watcher_map = Arc::new(RwLock::new(WatcherMap::new()));
         let kv_watcher = Arc::new(Self {
             storage,
-            watcher_map: RwLock::new(WatcherMap::new()),
+            watcher_map,
         });
-        let watcher = Arc::clone(&kv_watcher);
-        let _handle = tokio::spawn(async move {
-            while let Some(updates) = kv_update_rx.recv().await {
-                watcher.handle_kv_updates(updates);
+        let _victim_handle = tokio::spawn(Arc::clone(&kv_watcher).sync_victims_task());
+        let _kv_updates_handle = tokio::spawn({
+            let kv_watcher = Arc::clone(&kv_watcher);
+            async move {
+                while let Some(updates) = kv_update_rx.recv().await {
+                    kv_watcher.handle_kv_updates(updates);
+                }
             }
         });
         kv_watcher
     }
 
+    /// Background task to sync victims
+    async fn sync_victims_task(self: Arc<Self>) {
+        loop {
+            let victims = self
+                .watcher_map
+                .map_write(|mut m| m.victims.drain().collect::<Vec<_>>());
+            let mut new_victims = HashMap::new();
+            for (mut watcher, res) in victims {
+                if let Err(TrySendError::Full(updates)) = watcher.notify(res) {
+                    assert!(
+                        new_victims.insert(watcher, updates).is_none(),
+                        "can't insert watcher twice"
+                    );
+                } else {
+                    let mut watcher_map_w = self.watcher_map.write();
+                    let initial_events = self
+                        .storage
+                        .get_event_from_revision(watcher.key_range.clone(), watcher.start_rev)
+                        .unwrap_or_else(|e| {
+                            warn!("failed to get initial events for watcher: {:?}", e);
+                            vec![]
+                        });
+                    if !initial_events.is_empty() {
+                        let last_revision = get_last_revision(&initial_events);
+                        if let Err(TrySendError::Full(updates)) =
+                            watcher.notify((last_revision, initial_events))
+                        {
+                            assert!(
+                                new_victims.insert(watcher, updates).is_none(),
+                                "can't insert watcher twice"
+                            );
+                            break;
+                        };
+                    }
+                    debug!("register watcher: {:?}", watcher);
+                    watcher_map_w.register(watcher);
+                }
+            }
+            if !new_victims.is_empty() {
+                self.watcher_map.write().victims.extend(new_victims);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Handle KV store updates
     fn handle_kv_updates(&self, (revision, all_events): (i64, Vec<Event>)) {
-        let watcher_map_r = self.watcher_map.read();
-        let mut watcher_events: HashMap<&Watcher, Vec<Event>> = HashMap::new();
+        let mut watcher_map_w = self.watcher_map.write();
+        debug!(
+            "recv events from kv store: revision: {}, all_events: {:?}",
+            revision, all_events
+        );
+        let mut watcher_events: HashMap<WatchId, Vec<Event>> = HashMap::new();
         for event in all_events {
-            let watch_ids = watcher_map_r
+            let watch_ids = watcher_map_w
                 .index
                 .iter()
                 .filter_map(|(k, v)| {
@@ -328,30 +440,36 @@ where
                     .then_some(v)
                 })
                 .flatten()
+                .copied()
                 .collect_vec();
             for watch_id in watch_ids {
-                let watcher = watcher_map_r
-                    .watchers
-                    .get(watch_id)
-                    .unwrap_or_else(|| panic!("watcher index and watchers doesn't match"));
-                if event
-                    .kv
-                    .as_ref()
-                    .map_or(true, |kv| kv.mod_revision < watcher.start_rev)
-                {
-                    continue;
-                }
-                #[allow(clippy::indexing_slicing)]
                 watcher_events
-                    .entry(watcher)
+                    .entry(watch_id)
                     .or_default()
                     .push(event.clone());
             }
         }
-        for (watcher, events) in watcher_events {
-            watcher.notify((revision, events));
+        for (watch_id, events) in watcher_events {
+            let watcher = watcher_map_w
+                .watchers
+                .get_mut(&watch_id)
+                .unwrap_or_else(|| panic!("watcher index and watchers doesn't match"));
+            if let Err(TrySendError::Full(updates)) = watcher.notify((revision, events)) {
+                watcher_map_w.move_to_victim(watch_id, updates);
+            }
         }
     }
+}
+
+/// Get the last revision of a event slice
+fn get_last_revision(events: &[Event]) -> i64 {
+    events
+        .last()
+        .unwrap_or_else(|| unreachable!("events is not empty"))
+        .kv
+        .as_ref()
+        .unwrap_or_else(|| panic!("event.kv can't be None"))
+        .mod_revision
 }
 
 #[cfg(test)]
@@ -359,7 +477,7 @@ mod test {
 
     use std::{collections::BTreeMap, time::Duration};
 
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
     use utils::config::StorageConfig;
 
     use crate::{
@@ -371,7 +489,7 @@ mod test {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-    async fn it_works() {
+    async fn test_watch_concurrent() {
         let (store, db, kv_watcher) = init_empty_store();
         let mut map = BTreeMap::new();
         let handle = tokio::spawn({
@@ -392,7 +510,7 @@ mod test {
                 }
             }
         });
-        tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+        sleep(Duration::from_micros(500)).await;
         let (res_tx, mut res_rx) = mpsc::channel(128);
         let stop_notify = Arc::new(event_listener::Event::new());
         kv_watcher.watch(
@@ -410,6 +528,7 @@ mod test {
         {
             for event in event_batch.unwrap().events {
                 let val = event.kv.as_ref().unwrap().value[0];
+                debug!(val, "receive event");
                 let e = map.entry(val).or_insert(0);
                 *e += 1;
                 if val == 99 {
@@ -423,6 +542,53 @@ mod test {
             assert_eq!(count, 1, "key {k} should be notified once");
         }
         handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn test_victim() {
+        let (store, db, kv_watcher) = init_empty_store();
+        // response channel with capacity 1, so it will be full easily, than we can trigger victim
+        let (res_tx, mut res_rx) = mpsc::channel(1);
+        let stop_notify = Arc::new(event_listener::Event::new());
+
+        kv_watcher.watch(
+            123,
+            KeyRange::new_one_key("foo"),
+            0,
+            vec![],
+            stop_notify,
+            res_tx,
+        );
+
+        let mut expect = 0;
+        let handle = tokio::spawn(async move {
+            'outer: while let Some(result) = res_rx.recv().await {
+                let res = result.unwrap();
+                for event in res.events {
+                    let val = event.kv.as_ref().unwrap().value[0];
+                    assert_eq!(val, expect);
+                    expect += 1;
+                    if val == 99 {
+                        break 'outer;
+                    }
+                }
+            }
+        });
+
+        for i in 0..100_u8 {
+            let req = RequestWithToken::new(
+                PutRequest {
+                    key: "foo".into(),
+                    value: vec![i],
+                    ..Default::default()
+                }
+                .into(),
+            );
+            let (sync_res, ops) = store.after_sync(&req).await.unwrap();
+            db.flush_ops(ops).unwrap();
+            store.mark_index_available(sync_res.revision());
+        }
+        handle.await.unwrap();
     }
 
     fn init_empty_store() -> (Arc<KvStore<DB>>, Arc<DB>, Arc<KvWatcher<DB>>) {
