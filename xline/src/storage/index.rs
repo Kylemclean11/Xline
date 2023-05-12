@@ -44,7 +44,6 @@ impl Index {
 
     /// Get specified or last `KeyRevision` if the key is not deleted, and convert to `Revision`
     fn get_revision(revs: &[KeyRevision], revision: i64) -> Option<Revision> {
-        // TODO: handle future revision
         let rev = if revision <= 0 {
             revs.iter().rev().find(|kr| kr.available)
         } else {
